@@ -104,7 +104,7 @@ Guacamole.Tunnel = function() {
      * 
      * @type {!number}
      */
-    this.state = Guacamole.Tunnel.State.CONNECTING;
+    this.state = Guacamole.Tunnel.State.CLOSED;
 
     /**
      * The maximum amount of time to wait for data to be received, in
@@ -1094,7 +1094,7 @@ Guacamole.WebSocketTunnel = function(tunnelURL) {
                     if (tunnel.uuid === null) {
 
                         // Associate tunnel UUID if received
-                        if (opcode === Guacamole.Tunnel.INTERNAL_DATA_OPCODE)
+                        if (opcode === Guacamole.Tunnel.INTERNAL_DATA_OPCODE && elements.length === 1)
                             tunnel.setUUID(elements[0]);
 
                         // Tunnel is now open and UUID is available
@@ -1236,11 +1236,16 @@ Guacamole.ChainedTunnel = function(tunnelChain) {
             tunnel.onstatechange = chained_tunnel.onstatechange;
             tunnel.oninstruction = chained_tunnel.oninstruction;
             tunnel.onerror = chained_tunnel.onerror;
-            tunnel.onuuid = chained_tunnel.onuuid;
 
             // Assign UUID if already known
             if (tunnel.uuid)
                 chained_tunnel.setUUID(tunnel.uuid);
+
+            // Assign any future received UUIDs such that they are
+            // accessible from the main uuid property of the chained tunnel
+            tunnel.onuuid = function uuidReceived(uuid) {
+                chained_tunnel.setUUID(uuid);
+            };
 
             committedTunnel = tunnel;
 
@@ -1346,13 +1351,14 @@ Guacamole.StaticHTTPTunnel = function StaticHTTPTunnel(url, crossDomain, extraTu
     var tunnel = this;
 
     /**
-     * The current, in-progress HTTP request. If no request is currently in
-     * progress, this will be null.
+     * AbortController instance which allows the current, in-progress HTTP
+     * request to be aborted. If no request is currently in progress, this will
+     * be null.
      *
      * @private
-     * @type {XMLHttpRequest}
+     * @type {AbortController}
      */
-    var xhr = null;
+    var abortController = null;
 
     /**
      * Additional headers to be sent in tunnel requests. This dictionary can be
@@ -1365,21 +1371,12 @@ Guacamole.StaticHTTPTunnel = function StaticHTTPTunnel(url, crossDomain, extraTu
     var extraHeaders = extraTunnelHeaders || {};
 
     /**
-     * Adds the configured additional headers to the given request.
+     * The number of bytes in the file being downloaded, or null if this is not
+     * known.
      *
-     * @param {!XMLHttpRequest} request
-     *     The request where the configured extra headers will be added.
-     *
-     * @param {!object} headers
-     *     The headers to be added to the request.
-     *
-     * @private
+     * @type {number}
      */
-    function addExtraHeaders(request, headers) {
-        for (var name in headers) {
-            request.setRequestHeader(name, headers[name]);
-        }
-    }
+    this.size = null;
 
     this.sendMessage = function sendMessage(elements) {
         // Do nothing
@@ -1393,18 +1390,10 @@ Guacamole.StaticHTTPTunnel = function StaticHTTPTunnel(url, crossDomain, extraTu
         // Connection is now starting
         tunnel.setState(Guacamole.Tunnel.State.CONNECTING);
 
-        // Start a new connection
-        xhr = new XMLHttpRequest();
-        xhr.open('GET', url);
-        xhr.withCredentials = !!crossDomain;
-        addExtraHeaders(xhr, extraHeaders);
-        xhr.responseType = 'text';
-        xhr.send(null);
-
-        var offset = 0;
-
-        // Create Guacamole protocol parser specifically for this connection
+        // Create Guacamole protocol and UTF-8 parsers specifically for this
+        // connection
         var parser = new Guacamole.Parser();
+        var utf8Parser = new Guacamole.UTF8Parser();
 
         // Invoke tunnel's oninstruction handler for each parsed instruction
         parser.oninstruction = function instructionReceived(opcode, args) {
@@ -1412,51 +1401,65 @@ Guacamole.StaticHTTPTunnel = function StaticHTTPTunnel(url, crossDomain, extraTu
                 tunnel.oninstruction(opcode, args);
         };
 
-        // Continuously parse received data
-        xhr.onreadystatechange = function readyStateChanged() {
+        // Allow new request to be aborted
+        abortController = new AbortController();
 
-            // Parse while data is being received
-            if (xhr.readyState === 3 || xhr.readyState === 4) {
+        // Stream using the Fetch API
+        fetch(url, {
+            headers : extraHeaders,
+            credentials : crossDomain ? 'include' : 'same-origin',
+            signal : abortController.signal
+        })
+        .then(function gotResponse(response) {
 
-                // Connection is open
-                tunnel.setState(Guacamole.Tunnel.State.OPEN);
+            // Reset state and close upon error
+            if (!response.ok) {
 
-                var buffer = xhr.responseText;
-                var length = buffer.length;
+                if (tunnel.onerror)
+                    tunnel.onerror(new Guacamole.Status(
+                        Guacamole.Status.Code.fromHTTPCode(response.status), response.statusText));
 
-                // Parse only the portion of data which is newly received
-                if (offset < length) {
-                    parser.receive(buffer.substring(offset));
-                    offset = length;
-                }
+                tunnel.disconnect();
+                return;
 
             }
 
-            // Clean up and close when done
-            if (xhr.readyState === 4)
-                tunnel.disconnect();
+            // Report overall size of stream in bytes, if known
+            tunnel.size = response.headers.get('Content-Length');
 
-        };
+            // Connection is open
+            tunnel.setState(Guacamole.Tunnel.State.OPEN);
 
-        // Reset state and close upon error
-        xhr.onerror = function httpError() {
+            var reader = response.body.getReader();
+            var processReceivedText = function processReceivedText(result) {
 
-            // Fail if file could not be downloaded via HTTP
-            if (tunnel.onerror)
-                tunnel.onerror(new Guacamole.Status(
-                    Guacamole.Status.Code.fromHTTPCode(xhr.status), xhr.statusText));
+                // Clean up and close when done
+                if (result.done) {
+                    tunnel.disconnect();
+                    return;
+                }
 
-            tunnel.disconnect();
-        };
+                // Parse only the portion of data which is newly received
+                parser.receive(utf8Parser.decode(result.value));
+
+                // Continue parsing when next chunk is received
+                reader.read().then(processReceivedText);
+
+            };
+
+            // Schedule parse of first chunk
+            reader.read().then(processReceivedText);
+
+        });
 
     };
 
     this.disconnect = function disconnect() {
 
-        // Abort and dispose of XHR if a request is in progress
-        if (xhr) {
-            xhr.abort();
-            xhr = null;
+        // Abort any in-progress request
+        if (abortController) {
+            abortController.abort();
+            abortController = null;
         }
 
         // Connection is now closed
