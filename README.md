@@ -2,7 +2,7 @@
 
 # What is guacamole-common-js?
 
-guacamole-common-js is the core JavaScript library used by the Guacamole web
+A guacamole-common-js is the core JavaScript library used by the Guacamole web
 application.
 
 guacamole-common-js provides an efficient HTTP tunnel for transporting
